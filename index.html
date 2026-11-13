@@ -2444,17 +2444,33 @@ function noCertificado(hex){
   for (var i=0;i<hex.length;i+=2) s += String.fromCharCode(parseInt(hex.substr(i,2),16));
   return /^\d+$/.test(s) ? s : hex.toUpperCase();
 }
+function fingerprint(der){
+  var md = forge.md.sha256.create(); md.update(der);
+  return md.digest().toHex().toUpperCase().match(/../g).join(':');
+}
+function isSelfSigned(cert){
+  try { if (!cert.isIssuer(cert)) return false; } catch(e){ return false; }
+  try { return cert.verify(cert); } catch(e){ return true; }
+}
+var INST_DESC = 'Sello institucional FirmaPDF';
+function escH(v){ return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
 function certInfo(cert){
-  var uid = attr(cert.subject, OID.UID);
+  var uid = attr(cert.subject, OID.UID), desc = attr(cert.subject, '2.5.4.13');
+  var institucional = desc.indexOf(INST_DESC)!==-1;
   var issuerTxt = cert.issuer.attributes.map(function(a){return decodeVal(a.value);}).join(' ').toUpperCase();
+  var selfSigned = isSelfSigned(cert);
   return {
     nombre: attr(cert.subject, OID.NAME) || attr(cert.subject, OID.CN),
-    rfc: (uid.split('/')[0]||'').trim(),
-    curp: (attr(cert.subject, OID.SERIAL).split('/')[0]||'').trim(),
+    rfc: ((uid.split('/')[0]||'').trim()) || (institucional ? attr(cert.subject, OID.SERIAL).trim() : ''),
+    curp: institucional ? '' : (attr(cert.subject, OID.SERIAL).split('/')[0]||'').trim(),
     ou: attr(cert.subject, OID.OU),
+    responsable: attr(cert.subject, '2.5.4.12'),
     noCertificado: noCertificado(cert.serialNumber),
     emisor: attr(cert.issuer, OID.CN) || attr(cert.issuer, OID.O),
-    esSAT: issuerTxt.indexOf('SERVICIO DE ADMINISTRACION TRIBUTARIA')!==-1 || /\bSAT\b/.test(issuerTxt),
+    // un certificado autofirmado nunca cuenta como del SAT, aunque su emisor lo diga
+    esSAT: !selfSigned && issuerTxt.indexOf('SERVICIO DE ADMINISTRACION TRIBUTARIA')!==-1,
+    selfSigned: selfSigned, institucional: institucional,
+    fingerprint: cert._der ? fingerprint(cert._der) : '',
     desde: cert.validity.notBefore, hasta: cert.validity.notAfter
   };
 }
@@ -2602,11 +2618,12 @@ function qrLink(url, info, role, now, certifyP){
   var d = {n:info.nombre||'', r:info.rfc||'', c:info.noCertificado||'', f:Math.floor(now.getTime()/1000)};
   if (role) d.g = role;
   if (certifyP) d.p = certifyP;
+  if (info.institucional && info.fingerprint) d.h = info.fingerprint.replace(/:/g,'').slice(0,16);
   return String(url).trim().replace(/#.*$/,'') + '#v=' + b64url(JSON.stringify(d));
 }
 function parseQrHash(hash){
   var m = /^#?v=([A-Za-z0-9_-]+)/.exec(hash||''); if (!m) return null;
-  try { var d = JSON.parse(unb64url(m[1])); return {nombre:d.n, rfc:d.r, noCertificado:d.c, fecha:new Date(d.f*1000), cargo:d.g||'', certifyP:d.p||0}; }
+  try { var d = JSON.parse(unb64url(m[1])); return {nombre:d.n, rfc:d.r, noCertificado:d.c, fecha:new Date(d.f*1000), cargo:d.g||'', certifyP:d.p||0, huella:d.h||''}; }
   catch(e){ return null; }
 }
 function matchQr(q, results){
@@ -2627,7 +2644,9 @@ async function stampAppearance(info, opts, now){
   var c = [];
   c.push('q', '1 1 1 rg '+g+' RG 0.8 w', '0.4 0.4 '+(W-0.8)+' '+(H-0.8)+' re B');
   c.push(g+' rg 0 '+(H-14)+' '+W+' 14 re f');
-  var head = opts.certifyP===1 ? 'FIRMADO Y CERTIFICADO CON e.firma' : opts.certifyP ? 'FIRMADO Y CERTIFICADO CON e.firma' : 'FIRMADO ELECTRÓNICAMENTE CON e.firma';
+  var head = info.esSAT ? (opts.certifyP ? 'FIRMADO Y CERTIFICADO CON e.firma' : 'FIRMADO ELECTRÓNICAMENTE CON e.firma')
+           : info.institucional ? (opts.certifyP ? 'SELLO ELECTRÓNICO INSTITUCIONAL · CERTIFICADO' : 'SELLO ELECTRÓNICO INSTITUCIONAL')
+           : (opts.certifyP ? 'FIRMADO Y CERTIFICADO ELECTRÓNICAMENTE' : 'FIRMADO ELECTRÓNICAMENTE');
   c.push('BT /F2 7 Tf 1 1 1 rg 6 '+(H-10)+' Td '+pdfLit(winAnsi(head))+' Tj ET');
   // QR
   var qrTxt = opts.verifyUrl ? qrLink(opts.verifyUrl, info, opts.role, now, opts.certifyP)
@@ -2644,12 +2663,14 @@ async function stampAppearance(info, opts, now){
   var foot = opts.certifyP===1 ? 'Cualquier modificación posterior invalida esta firma.' : 'Las modificaciones posteriores quedan registradas.';
   var lines = [
     ['F2', F.bold, 8, info.nombre||'', ink],
-    ['F1', F.reg, 6.8, 'RFC: '+(info.rfc||'—'), ink],
-    ['F1', F.reg, 6.8, 'No. certificado: '+info.noCertificado, ink],
+    info.rfc ? ['F1', F.reg, 6.8, 'RFC: '+info.rfc, ink] : null,
+    ['F1', F.reg, 6.8, info.institucional && info.fingerprint ? 'Huella: '+info.fingerprint.slice(0,35)+'…' : 'No. certificado: '+info.noCertificado, ink],
     ['F1', F.reg, 6.8, 'Fecha: '+fmtLocal(now), ink],
     ['F1', F.reg, 6.3, line2, mut],
     ['F1', F.reg, 5.7, foot, mut]
   ];
+  lines = lines.filter(Boolean);
+  if (lines.length<6) ty -= 2;   // sin RFC: centrar un poco el bloque de texto
   lines.forEach(function(l){
     c.push('BT /'+l[0]+' '+l[2]+' Tf '+l[4]+' rg '+tx+' '+ty.toFixed(2)+' Td '+pdfLit(fitText(l[1], l[3], l[2], tw))+' Tj ET');
     ty -= l[2]+3.4;
@@ -2739,7 +2760,7 @@ function placeRect(box, fw, fh, pos, occupied){
 async function placeholderAppearance(role){
   var F = await metrics(), W=STAMP_W, H=STAMP_H, c=[];
   c.push('q 0.97 0.98 0.975 rg 0.55 0.6 0.58 RG 0.8 w [3 2] 0 d 0.4 0.4 '+(W-0.8)+' '+(H-0.8)+' re B Q');
-  c.push('BT /F2 7.5 Tf 0.35 0.4 0.38 rg 12 '+(H/2+8)+' Td '+pdfLit(winAnsi('ESPACIO RESERVADO PARA FIRMA CON e.firma'))+' Tj ET');
+  c.push('BT /F2 7.5 Tf 0.35 0.4 0.38 rg 12 '+(H/2+8)+' Td '+pdfLit(winAnsi('ESPACIO RESERVADO PARA FIRMA ELECTRÓNICA'))+' Tj ET');
   c.push('BT /F1 7.5 Tf 0.35 0.4 0.38 rg 12 '+(H/2-6)+' Td '+pdfLit(fitText(F.reg, role ? 'Firmante: '+role : 'Firmante adicional', 7.5, W-24))+' Tj ET');
   return c.join('\n');
 }
@@ -2755,6 +2776,49 @@ async function inspectPdf(u8){
     res.signed = ex.signed.length;
   } catch(e){ res.error = /encrypt/i.test(e.message) ? 'encrypted' : e.message; }
   return res;
+}
+
+/* ---------- CERTIFICADO INSTITUCIONAL (autofirmado, generado en el navegador) ---------- */
+function createInstitutional(o){
+  return new Promise(function(resolve, reject){
+    forge.pki.rsa.generateKeyPair({bits: o.bits||2048, workers:0}, function(err, kp){
+      if (err) return reject(err);
+      try {
+        var U = function(v){ return {valueTagClass: forge.asn1.Type.UTF8, value: v}; };   // forge codifica a UTF-8
+        var attrs = [
+          Object.assign({type:OID.CN}, U(o.razon)),
+          Object.assign({type:OID.O}, U(o.razon)),
+          Object.assign({type:'2.5.4.13'}, U(INST_DESC+(o.comercial?' · '+o.comercial:''))),
+          {type:'2.5.4.6', value:'MX'}
+        ];
+        if (o.rfc) attrs.splice(2, 0, {type:OID.SERIAL, value:o.rfc});   // RFC opcional
+        if (o.estado) attrs.push(Object.assign({type:'2.5.4.8'}, U(o.estado)));
+        if (o.ciudad) attrs.push(Object.assign({type:'2.5.4.7'}, U(o.ciudad)));
+        if (o.responsable) attrs.push(Object.assign({type:'2.5.4.12'}, U(o.responsable)));
+        if (o.email) attrs.push({type:'1.2.840.113549.1.9.1', value:o.email, valueTagClass: forge.asn1.Type.IA5STRING});
+        var cert = forge.pki.createCertificate();
+        cert.publicKey = kp.publicKey;
+        var sn = forge.util.bytesToHex(forge.random.getBytesSync(16)); sn = (parseInt(sn[0],16)&7).toString(16)+sn.slice(1);
+        cert.serialNumber = sn;
+        var now = new Date(); cert.validity.notBefore = new Date(now.getTime()-5*60000);
+        var until = new Date(now); until.setFullYear(until.getFullYear()+(o.years||2)); cert.validity.notAfter = until;
+        cert.setSubject(attrs); cert.setIssuer(attrs);
+        cert.setExtensions([
+          {name:'basicConstraints', cA:false, critical:true},
+          {name:'keyUsage', critical:true, digitalSignature:true, nonRepudiation:true},
+          {name:'extKeyUsage', emailProtection:true},
+          {name:'subjectKeyIdentifier'}
+        ]);
+        cert.sign(kp.privateKey, forge.md.sha256.create());
+        var cerDer = forge.asn1.toDer(forge.pki.certificateToAsn1(cert)).getBytes();
+        var enc = forge.pki.encryptPrivateKeyInfo(forge.pki.wrapRsaPrivateKey(forge.pki.privateKeyToAsn1(kp.privateKey)),
+                    o.password, {algorithm:'aes256', count:10000, saltSize:16, prfAlgorithm:'sha256'});
+        var keyDer = forge.asn1.toDer(enc).getBytes();
+        var parsed = parseCert(binToU8(cerDer));
+        resolve({cer: binToU8(cerDer), key: binToU8(keyDer), info: certInfo(parsed), signer: {cert: parsed, key: kp.privateKey, info: certInfo(parsed)}});
+      } catch(e){ reject(e); }
+    });
+  });
 }
 
 /* ---------- FIRMAR (actualización incremental) ---------- */
@@ -3040,7 +3104,9 @@ async function verifyPdf(u8){
         if (ch.tagClass===forge.asn1.Class.UNIVERSAL && ch.type===forge.asn1.Type.OCTETSTRING) sigBytes = ch.value;
       });
       var serialHex = forge.util.bytesToHex(signerInfo.value[1].value[1].value).replace(/^0+/,'');
-      msg.certificates.forEach(function(c){ if (c.serialNumber.replace(/^0+/,'')===serialHex) cert=c; });
+      var rawCerts = (msg.rawCapture.certificates && msg.rawCapture.certificates.value) || [];
+      cert._der = rawCerts[0] ? forge.asn1.toDer(rawCerts[0]).getBytes() : '';
+      msg.certificates.forEach(function(c,ci){ if (c.serialNumber.replace(/^0+/,'')===serialHex){ cert=c; cert._der = rawCerts[ci] ? forge.asn1.toDer(rawCerts[ci]).getBytes() : ''; } });
       r.info = certInfo(cert);
       var mdName = {'2.16.840.1.101.3.4.2.1':'sha256','2.16.840.1.101.3.4.2.2':'sha384','2.16.840.1.101.3.4.2.3':'sha512','1.3.14.3.2.26':'sha1'}[digestOid];
       if (!mdName) throw new Error('Algoritmo de resumen no soportado ('+digestOid+')');
@@ -3084,21 +3150,23 @@ async function verifyPdf(u8){
           r.checks.push([null, '<b>El archivo tiene contenido agregado después de esta firma</b> y no se pudo analizar qué cambió.']);
       }
       if (s.certify) r.checks.push([true, 'Firma de certificación (DocMDP P='+r.mdp+'): '+(r.mdp===1?'no se permite ningún cambio.':r.mdp===2?'solo se permite agregar firmas o llenar formularios.':'se permiten firmas, formularios y anotaciones.')]);
-      r.checks.push([r.info.esSAT ? true : null, r.info.esSAT ? 'Certificado emitido por el SAT ('+r.info.emisor+').' : 'El certificado <b>no fue emitido por el SAT</b> ('+r.info.emisor+').']);
+      if (r.info.esSAT) r.checks.push([true, 'Emisor declarado: SAT ('+escH(r.info.emisor)+').']);
+      else if (r.info.institucional) r.checks.push([null, 'Sello institucional de <b>'+escH(r.info.nombre)+'</b> (no es e.firma del SAT). Huella SHA-256:<br><span class="mono">'+escH(r.info.fingerprint)+'</span>']);
+      else r.checks.push([null, 'El certificado <b>no es del SAT</b>'+(r.info.selfSigned?' (autofirmado)':'')+': '+escH(r.info.emisor)+'.']);
       if (signTime) r.checks.push([signTime>=r.info.desde && signTime<=r.info.hasta, signTime>=r.info.desde && signTime<=r.info.hasta ? 'El certificado estaba vigente en la fecha de firma declarada.' : 'El certificado no estaba vigente en la fecha de firma declarada.']);
       r.ok = integrityOk && sigOk;
       r.contentChanged = !!(r.changes && r.changes.length) || (!coversAll && r.analyzed===false);
       r.violation = !coversAll && s.certify && (r.mdp===1 || r.contentChanged);
     } catch(e){
       r.error = e.message||String(e);
-      r.checks.push([false, 'No se pudo analizar la firma: '+r.error]);
+      r.checks.push([false, 'No se pudo analizar la firma: '+escH(r.error)]);
     }
     out.push(r);
   }
   return out;
 }
 
-return {placeRect:placeRect, footprint:footprint, parseQrHash:parseQrHash, matchQr:matchQr, inspectPdf:inspectPdf, loadSigner:loadSigner, certInfo:certInfo, signPdf:signPdf, verifyPdf:verifyPdf, signingStatus:signingStatus,
+return {createInstitutional:createInstitutional, fingerprint:fingerprint, placeRect:placeRect, footprint:footprint, parseQrHash:parseQrHash, matchQr:matchQr, inspectPdf:inspectPdf, loadSigner:loadSigner, certInfo:certInfo, signPdf:signPdf, verifyPdf:verifyPdf, signingStatus:signingStatus,
         hasSignatures:hasSignatures, fmtLocal:fmtLocal, u8ToBin:u8ToBin, binToU8:binToU8};
 })();
 if (typeof module!=='undefined') module.exports = FirmaCore;
@@ -3117,6 +3185,7 @@ if (typeof module!=='undefined') module.exports = FirmaCore;
   <nav class="tabs">
     <button data-tab="firmar" class="on">✍️ Firmar PDF</button>
     <button data-tab="verificar">🔍 Verificar PDF</button>
+    <button data-tab="sello">🏢 Sello institucional</button>
     <button data-tab="ayuda">ℹ️ Cómo funciona</button>
   </nav>
 
@@ -3208,6 +3277,45 @@ if (typeof module!=='undefined') module.exports = FirmaCore;
     </div>
   </section>
 
+  <!-- ================= SELLO INSTITUCIONAL ================= -->
+  <section id="tab-sello" class="hidden">
+    <div class="card">
+      <h2>Crear sello institucional</h2>
+      <p class="sub">Genera un certificado (.cer) y una llave privada (.key) a nombre de la consultoría o empresa, para firmar documentos con FirmaPDF. Todo se genera en este navegador: la llave no sale de tu computadora.</p>
+      <div class="msg warn"><b>No es una e.firma del SAT.</b> Es un sello electrónico propio: prueba que el documento salió de la institución y que no fue modificado, ante quien confíe en su huella digital. Para trámites ante autoridades usa la e.firma (persona física o moral) emitida por el SAT.</div>
+      <div class="grid2">
+        <div><label>Razón social o nombre de la institución *</label><input type="text" id="iRazon" placeholder="Ej. BIOMATEC CONSULTORÍA AMBIENTAL S.C."></div>
+        <div><label>RFC (opcional)</label><input type="text" id="iRfc" placeholder="Déjalo vacío si la marca o empresa no tiene RFC" maxlength="13" style="text-transform:uppercase"></div>
+        <div><label>Nombre comercial</label><input type="text" id="iComercial" placeholder="Ej. Biomatec"></div>
+        <div><label>Responsable del sello</label><input type="text" id="iResp" placeholder="Ej. Ing. Juan Pérez, Director técnico"></div>
+        <div><label>Correo de contacto</label><input type="text" id="iEmail" placeholder="contacto@empresa.mx"></div>
+        <div><label>Ciudad</label><input type="text" id="iCiudad" placeholder="Morelia"></div>
+        <div><label>Estado</label><input type="text" id="iEstado" placeholder="Michoacán"></div>
+        <div><label>Vigencia</label><select id="iYears"><option value="1">1 año</option><option value="2" selected>2 años</option><option value="3">3 años</option><option value="4">4 años (como la e.firma)</option></select></div>
+      </div>
+      <div class="grid2">
+        <div><label>Contraseña de la llave privada * (mínimo 8 caracteres)</label><input type="password" id="iPwd" autocomplete="new-password"></div>
+        <div><label>Confirmar contraseña *</label><input type="password" id="iPwd2" autocomplete="new-password"></div>
+      </div>
+      <label>Seguridad de la llave</label>
+      <div class="seg" id="bitsSeg"><button data-v="2048" class="on">RSA 2048 (como el SAT)</button><button data-v="3072">RSA 3072 (más robusta, tarda más)</button></div>
+      <label class="opt" style="margin-top:14px"><input type="checkbox" id="iAuth">
+        <div><b>Confirmo que estoy autorizado por la institución para emitir este sello a su nombre.</b><span>El sello identifica a la institución: solo debe tenerlo quien pueda firmar en su representación.</span></div></label>
+      <button class="btn big" id="btnGen">🏢 Generar sello institucional</button>
+      <div id="genMsg"></div>
+      <div id="genResult"></div>
+    </div>
+
+    <div class="card">
+      <h2>Certificados de confianza</h2>
+      <p class="sub">El verificador marca como <b>de confianza</b> los sellos institucionales cuya huella esté en esta lista. Puedes agregar el tuyo o el que te comparta otra institución.</p>
+      <div id="trustList"></div>
+      <label>Agregar un certificado (.cer) a la lista de este equipo</label>
+      <input type="file" id="fTrust" accept=".cer,.crt,.pem">
+      <div id="trustMsg"></div>
+    </div>
+  </section>
+
   <!-- ================= AYUDA ================= -->
   <section id="tab-ayuda" class="hidden">
     <div class="card">
@@ -3224,6 +3332,13 @@ if (typeof module!=='undefined') module.exports = FirmaCore;
         <li>Si el documento se <b>certifica</b>, el primer firmante reserva un espacio para cada firmante siguiente. Después solo se puede firmar en esos espacios; cualquier otra modificación se marca como no permitida.</li>
         <li>Pueden firmar todos en la misma computadora (botón <b>(+) Agregar firmante</b>) o por turnos: cada quien carga el PDF que ya trae las firmas anteriores y agrega la suya.</li>
         <li>Para firmas posteriores en otra computadora, al certificar escribe sus cargos en <i>Reservar espacios</i>.</li>
+      </ul>
+      <h2 style="margin-top:16px">Sello institucional</h2>
+      <ul>
+        <li>Es un certificado propio de la consultoría o empresa, creado en la pestaña <b>Sello institucional</b>. Firma igual que la e.firma y deja el mismo rastro si el documento se modifica.</li>
+        <li><b>No es una e.firma del SAT</b>: su sello dice “SELLO ELECTRÓNICO INSTITUCIONAL”. Su valor depende de que quien lo revise confíe en la <b>huella digital</b> que publica la institución.</li>
+        <li>El verificador lo marca como <b>de confianza</b> cuando su huella está en la lista: la de este equipo o la incluida en la página (<code>FIRMAPDF_CONFIANZA</code>).</li>
+        <li>Un buen uso es combinarlo: el sello de la consultoría más la e.firma personal del responsable técnico en el mismo PDF.</li>
       </ul>
       <h2 style="margin-top:16px">Al abrirlo en Adobe Acrobat</h2>
       <p>El panel de firmas mostrará cada firma y si el documento cambió. Adobe puede indicar <i>“la identidad del firmante es desconocida”</i> porque no trae de fábrica los certificados raíz del SAT. Se resuelve una sola vez en cada computadora: <i>Mostrar propiedades de firma → Mostrar certificado</i>, selecciona el certificado raíz del SAT y agrégalo a los certificados de confianza.</p>
@@ -3253,22 +3368,40 @@ var seq = 0, lastSigned = null;
 /* ---------- descargas (navegador normal o visor de Claude) ---------- */
 var dlNs = null;
 try { if (window.claude && typeof window.claude.use==='function') window.claude.use('downloads').then(function(n){dlNs=n;}).catch(function(){}); } catch(e){}
-async function saveFile(name, u8){
-  var blob = new Blob([u8], {type:'application/pdf'});
+async function saveFile(name, data, mime){
+  var blob = new Blob([data], {type: mime||'application/pdf'});
   if (dlNs){
     try { await dlNs.save({filename:name, data:blob}); return 'saved'; }
-    catch(e){ if (e && e.code==='declined') return 'declined'; if (!(e && /unavailable|not_granted|capability/.test(e.code||''))) throw e; }
+    catch(e){ if (e && e.code==='declined') return 'declined'; if (e && e.code==='rejected_extension') return 'rejected'; if (!(e && /unavailable|not_granted|capability/.test(e.code||''))) throw e; }
   }
   var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
   document.body.appendChild(a); a.click(); setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 2000);
   return 'saved';
 }
 
+/* ---------- certificados de confianza ----------
+   Para que el verificador publicado (p. ej. en GitHub Pages) reconozca un sello en cualquier equipo,
+   agrega su huella a esta lista:  {fp:'AA:BB:…', nombre:'Institución'},                      */
+var FIRMAPDF_CONFIANZA = [
+];
+function localTrust(){ try { return JSON.parse(localStorage.getItem('firmapdf:confianza')||'[]'); } catch(e){ return []; } }
+function saveLocalTrust(l){ try { localStorage.setItem('firmapdf:confianza', JSON.stringify(l)); return true; } catch(e){ return false; } }
+function trusted(fp){
+  if (!fp) return null;
+  var f = FIRMAPDF_CONFIANZA.filter(function(t){ return t.fp===fp; })[0]; if (f) return {nombre:f.nombre, origen:'página'};
+  var l = localTrust().filter(function(t){ return t.fp===fp; })[0]; if (l) return {nombre:l.nombre, origen:'equipo'};
+  return null;
+}
+function addTrust(fp, nombre){
+  var l = localTrust().filter(function(t){ return t.fp!==fp; }); l.push({fp:fp, nombre:nombre, alta:new Date().toISOString().slice(0,10)});
+  var ok = saveLocalTrust(l); renderTrust(); return ok;
+}
+
 /* ---------- pestañas ---------- */
 document.querySelectorAll('nav.tabs button').forEach(function(b){
   b.addEventListener('click', function(){
     document.querySelectorAll('nav.tabs button').forEach(function(x){ x.classList.toggle('on', x===b); });
-    ['firmar','verificar','ayuda'].forEach(function(t){ $('#tab-'+t).classList.toggle('hidden', t!==b.dataset.tab); });
+    ['firmar','verificar','sello','ayuda'].forEach(function(t){ $('#tab-'+t).classList.toggle('hidden', t!==b.dataset.tab); });
   });
 });
 
@@ -3408,13 +3541,14 @@ function setLoaded(s, sg){
   if (signers.some(function(o){ return o!==s && o.signer && !o.signer.test && !sg.test && o.signer.info.noCertificado===i.noCertificado; }))
     w.push('<div class="msg warn">Esta e.firma ya está cargada en otro firmante.</div>');
   if (now<i.desde || now>i.hasta) w.push('<div class="msg bad">El certificado <b>no está vigente</b>.</div>');
-  if (!i.esSAT) w.push('<div class="msg warn">No es un certificado del SAT'+(sg.test?' (certificado de prueba: sin validez legal).':'.')+'</div>');
+  if (i.institucional) w.push('<div class="msg info">🏢 <b>Sello institucional</b> (no es e.firma del SAT). '+(trusted(i.fingerprint)?'Está en la lista de confianza.':'Su huella no está en la lista de confianza de este equipo.')+'</div>');
+  else if (!i.esSAT) w.push('<div class="msg warn">No es un certificado del SAT'+(sg.test?' (certificado de prueba: sin validez legal).':'.')+'</div>');
   if (i.ou) w.push('<div class="msg warn">Podría ser un <b>CSD de facturación</b> y no una e.firma.</div>');
   $('.sg-pwd',el).value='';
   $('.sg-form',el).classList.add('hidden'); msg($('.sg-msg',el));
   var info = $('.sg-info',el);
   info.innerHTML = '<div class="sg-loaded"><div>✅ <b>'+esc(i.nombre)+'</b> '+(sg.test?'<span class="badge">PRUEBA</span>':'')+
-    '<div class="note">RFC '+esc(i.rfc||'—')+' · Certificado '+esc(i.noCertificado)+' · Vigente hasta '+(i.hasta?i.hasta.toISOString().slice(0,10):'—')+'</div></div>'+
+    '<div class="note">'+(i.rfc?'RFC '+esc(i.rfc)+' · ':'')+'Certificado '+esc(i.noCertificado)+' · Vigente hasta '+(i.hasta?ymd(i.hasta):'—')+'</div></div>'+
     '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end"><button class="btn sec sg-change" style="margin:0">Cambiar</button>'+
     '<button class="btn sec sg-forget" style="margin:0;color:var(--bad);background:var(--badbg)">🗑 Olvidar e.firma</button></div></div>'+
     '<label>Cargo o función (aparece en el sello)</label><div class="sg-roleslot"></div>'+w.join('');
@@ -3560,12 +3694,21 @@ setupDrop('#dropVerify', '#fVerify', async function(file){
   var allOk = res.every(function(r){return r.ok;});
   var changed = res.some(function(r){return r.contentChanged;});
   var violation = res.some(function(r){return r.violation;});
-  var test = res.some(function(r){return r.info && !r.info.esSAT;});
+  res.forEach(function(r){
+    if (r.info && r.info.institucional){
+      var t = trusted(r.info.fingerprint);
+      r.trusted = t;
+      r.checks = r.checks.map(function(c){
+        return /^Sello institucional de/.test(c[1]) ? (t ? [true, 'Sello institucional <b>de confianza</b>: '+esc(t.nombre)+' (huella registrada en '+(t.origen==='página'?'esta página':'este equipo')+').'] : [null, c[1]+'<br>Compárala con la huella que publica la institución; si coincide, agrégala a <i>Certificados de confianza</i>.']) : c;
+      });
+    }
+  });
+  var test = res.some(function(r){return r.info && !r.info.esSAT && !r.trusted;});
   var n = res.length+' firma'+(res.length>1?'s':'');
   var v = !allOk ? ['bad','❌ El documento fue alterado o una firma no es válida']
         : violation ? ['bad','❌ El documento fue modificado después de certificarse']
         : changed ? ['warn','⚠️ Las firmas son válidas, pero el documento se modificó después de firmarse']
-        : test ? ['warn','✅ Documento íntegro ('+n+') · incluye certificados que no son del SAT']
+        : test ? ['warn','✅ Documento íntegro ('+n+') · incluye certificados que no son del SAT ni están en la lista de confianza']
         : ['ok','✅ Documento íntegro: '+n+' válida'+(res.length>1?'s':'')+' y sin modificaciones'];
   var icon = function(x){ return x===true?'✅':x===false?'❌':'⚠️'; };
   var qrRes = '';
@@ -3581,12 +3724,153 @@ setupDrop('#dropVerify', '#fVerify', async function(file){
     return '<div class="sigcard"><div class="kv">'+
       '<div>Firma</div><div><b>#'+r.index+'</b> '+(r.certify?'· Certificación':'· Aprobación')+'</div>'+
       '<div>Firmante</div><div><b>'+esc(i.nombre||'—')+'</b></div>'+
-      '<div>RFC</div><div>'+esc(i.rfc||'—')+'</div>'+
+      (i.rfc?'<div>RFC</div><div>'+esc(i.rfc)+'</div>':'')+
       '<div>No. certificado</div><div class="mono">'+esc(i.noCertificado||'—')+'</div>'+
+      (i.institucional && i.responsable ? '<div>Responsable</div><div>'+esc(i.responsable)+'</div>' : '')+
       '<div>Fecha de firma</div><div>'+fmtDate(r.signTime)+'</div></div>'+
       '<ul class="checks">'+r.checks.map(function(c){return '<li><span>'+icon(c[0])+'</span><span>'+c[1]+'</span></li>';}).join('')+'</ul></div>';
   }).join('');
 });
+/* ---------- SELLO INSTITUCIONAL ---------- */
+var genBits = '2048', lastInst = null;
+seg('#bitsSeg', '_bits');
+document.querySelectorAll('#bitsSeg button').forEach(function(b){ b.addEventListener('click', function(){ genBits = b.dataset.v; }); });
+$('#iAuth').addEventListener('change', function(){ this.closest('.opt').classList.toggle('on', this.checked); });
+
+/* ZIP sin compresión (método STORE) */
+var CRC_T = (function(){ var t=[]; for (var n=0;n<256;n++){ var c=n; for (var k=0;k<8;k++) c = c&1 ? 0xEDB88320^(c>>>1) : c>>>1; t[n]=c>>>0; } return t; })();
+function crc32(u8){ var c=0xFFFFFFFF; for (var i=0;i<u8.length;i++) c = CRC_T[(c^u8[i])&255]^(c>>>8); return (c^0xFFFFFFFF)>>>0; }
+function makeZip(files){
+  var enc = new TextEncoder(), parts=[], central=[], off=0;
+  var d = new Date(), dt = ((d.getHours()<<11)|(d.getMinutes()<<5)|(d.getSeconds()>>1)), dd = (((d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate());
+  files.forEach(function(f){
+    var name = enc.encode(f.name), data = typeof f.data==='string' ? enc.encode(f.data) : f.data, crc = crc32(data);
+    var h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0,0x04034b50,true); h.setUint16(4,20,true); h.setUint16(6,0x0800,true); h.setUint16(8,0,true);
+    h.setUint16(10,dt,true); h.setUint16(12,dd,true); h.setUint32(14,crc,true); h.setUint32(18,data.length,true); h.setUint32(22,data.length,true);
+    h.setUint16(26,name.length,true); h.setUint16(28,0,true);
+    parts.push(new Uint8Array(h.buffer), name, data);
+    var c = new DataView(new ArrayBuffer(46));
+    c.setUint32(0,0x02014b50,true); c.setUint16(4,20,true); c.setUint16(6,20,true); c.setUint16(8,0x0800,true); c.setUint16(10,0,true);
+    c.setUint16(12,dt,true); c.setUint16(14,dd,true); c.setUint32(16,crc,true); c.setUint32(20,data.length,true); c.setUint32(24,data.length,true);
+    c.setUint16(28,name.length,true); c.setUint32(42,off,true);
+    central.push(new Uint8Array(c.buffer), name);
+    off += 30+name.length+data.length;
+  });
+  var cs = central.reduce(function(a,b){return a+b.length;},0), e = new DataView(new ArrayBuffer(22));
+  e.setUint32(0,0x06054b50,true); e.setUint16(8,files.length,true); e.setUint16(10,files.length,true); e.setUint32(12,cs,true); e.setUint32(16,off,true);
+  var all = parts.concat(central,[new Uint8Array(e.buffer)]), n = all.reduce(function(a,b){return a+b.length;},0), out = new Uint8Array(n), p=0;
+  all.forEach(function(a){ out.set(a,p); p+=a.length; });
+  return out;
+}
+function ymd(d){ var p=function(n){return String(n).padStart(2,'0');}; return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate()); }
+function slug(s){ return String(s||'sello').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,'').slice(0,40)||'sello'; }
+
+$('#btnGen').addEventListener('click', async function(){
+  msg('#genMsg'); $('#genResult').innerHTML='';
+  var o = {razon:$('#iRazon').value.trim(), rfc:$('#iRfc').value.trim().toUpperCase(), comercial:$('#iComercial').value.trim(),
+           responsable:$('#iResp').value.trim(), email:$('#iEmail').value.trim(), ciudad:$('#iCiudad').value.trim(), estado:$('#iEstado').value.trim(),
+           years:+$('#iYears').value, password:$('#iPwd').value, bits:+genBits};
+  var err = !o.razon ? 'Escribe la razón social o el nombre de la institución.' :
+            o.rfc && !/^[A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3}$/.test(o.rfc) ? 'El RFC no tiene un formato válido (12 caracteres para persona moral, 13 para física). Si no tiene RFC, deja el campo vacío.' :
+            o.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(o.email) ? 'El correo no es válido.' :
+            o.password.length<8 ? 'La contraseña debe tener al menos 8 caracteres.' :
+            o.password!==$('#iPwd2').value ? 'Las contraseñas no coinciden.' :
+            !$('#iAuth').checked ? 'Confirma que estás autorizado para emitir el sello de la institución.' : '';
+  if (err) return msg('#genMsg','bad',err);
+  var btn=this; btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Generando llave RSA '+o.bits+'…';
+  try {
+    var r = await FirmaCore.createInstitutional(o);
+    // comprobación: volver a abrir el .key con la contraseña, como lo hará quien firme
+    var check = FirmaCore.loadSigner(r.cer, r.key, o.password);
+    lastInst = {cer:r.cer, key:r.key, info:check.info, signer:check, base:slug(o.comercial||o.razon)+'_sello_institucional', o:o};
+    $('#iPwd').value=''; $('#iPwd2').value='';
+    addTrust(check.info.fingerprint, check.info.nombre);
+    renderInstResult();
+  } catch(e){ msg('#genMsg','bad','No se pudo generar: '+esc(e.message||e)); }
+  btn.disabled=false; btn.innerHTML='🏢 Generar sello institucional';
+});
+
+function leeme(L){
+  var i=L.info;
+  return ['SELLO ELECTRÓNICO INSTITUCIONAL — '+i.nombre, '',
+    (i.rfc?'RFC: '+i.rfc:''), (i.responsable?'Responsable: '+i.responsable:''), 'Vigencia: '+ymd(i.desde)+' a '+ymd(i.hasta),
+    'Número de serie: '+i.noCertificado, '', 'HUELLA DIGITAL (SHA-256) — publícala para que otros puedan verificar tus documentos:', i.fingerprint, '',
+    'Archivos:', '  '+L.base+'.cer  certificado público (se puede compartir)', '  '+L.base+'.key  llave privada CIFRADA con tu contraseña (NO la compartas)', '',
+    'Importante:', '- Este sello no es una e.firma del SAT. Úsalo para documentos internos o entregables; para trámites oficiales usa la e.firma.',
+    '- Guarda el .key y la contraseña en un lugar seguro. Si los pierdes no se pueden recuperar; si alguien más los obtiene, emite un sello nuevo y avisa que la huella anterior ya no es válida.',
+    '- Generado con FirmaPDF el '+new Date().toISOString().slice(0,10)+'.'].filter(function(x){return x!=='';}).join('\r\n').replace('Archivos:','\r\nArchivos:').replace('Importante:','\r\nImportante:');
+}
+function renderInstResult(){
+  var L = lastInst, i = L.info;
+  var snippet = "  {fp:'"+i.fingerprint+"', nombre:'"+String(i.nombre).replace(/'/g,"\\'")+"'},";
+  $('#genResult').innerHTML =
+    '<div class="verdict ok">✅ Sello institucional generado</div>'+
+    '<div class="kv" style="margin-top:10px"><div>Institución</div><div><b>'+esc(i.nombre)+'</b></div>'+(i.rfc?'<div>RFC</div><div>'+esc(i.rfc)+'</div>':'')+
+    (i.responsable?'<div>Responsable</div><div>'+esc(i.responsable)+'</div>':'')+
+    '<div>Vigencia</div><div>'+ymd(i.desde)+' → '+ymd(i.hasta)+'</div>'+
+    '<div>No. de serie</div><div class="mono">'+esc(i.noCertificado)+'</div></div>'+
+    '<label>Huella digital SHA-256 (publícala en tu página o compártela con quien vaya a verificar)</label>'+
+    '<div class="sigcard mono" style="font-size:14px;margin-top:4px">'+esc(i.fingerprint)+'</div>'+
+    '<button class="btn sec" id="cpFp">📋 Copiar huella</button>'+
+    '<div style="margin-top:6px"><button class="btn" id="dlZip">⬇️ Descargar todo (.zip)</button><button class="btn sec" id="dlCer">Descargar .cer</button><button class="btn sec" id="dlKey">Descargar .key</button></div>'+
+    '<div id="dlMsg"></div>'+
+    '<div class="msg warn">Guarda el <b>.key</b> y la contraseña en un lugar seguro: no se pueden recuperar. El .zip incluye un LEEME con la huella y las instrucciones.</div>'+
+    '<button class="btn" id="useInst">✍️ Usar ahora para firmar</button>'+
+    '<div class="msg ok">⭐ Se agregó a los certificados de confianza de este equipo.</div>'+
+    '<details><summary>Para que tu verificador en GitHub lo reconozca en cualquier equipo</summary>'+
+    '<p class="note">Abre el <b>index.html</b> de tu repositorio, busca <code>var FIRMAPDF_CONFIANZA = [</code> y pega esta línea debajo:</p>'+
+    '<div class="sigcard mono">'+esc(snippet)+'</div><button class="btn sec" id="cpSnip">📋 Copiar línea</button></details>';
+  var copy = async function(t, el){ try { await navigator.clipboard.writeText(t); el.textContent='✅ Copiado'; } catch(e){ el.textContent='Selecciona y copia manualmente'; } };
+  $('#cpFp').addEventListener('click', function(){ copy(i.fingerprint, this); });
+  $('#cpSnip').addEventListener('click', function(){ copy(snippet, this); });
+  var dl = async function(name, data, mime){
+    try { var st = await saveFile(name, data, mime);
+      if (st==='rejected') msg('#dlMsg','warn','Esta vista no permite descargar archivos .cer/.key sueltos: usa <b>Descargar todo (.zip)</b>.');
+      else if (st==='declined') msg('#dlMsg','info','Descarga cancelada.'); }
+    catch(e){ msg('#dlMsg','bad','No se pudo descargar: '+esc((e&&e.message)||e)); }
+  };
+  $('#dlCer').addEventListener('click', function(){ dl(L.base+'.cer', L.cer, 'application/pkix-cert'); });
+  $('#dlKey').addEventListener('click', function(){ dl(L.base+'.key', L.key, 'application/octet-stream'); });
+  $('#dlZip').addEventListener('click', function(){
+    dl(L.base+'.zip', makeZip([{name:L.base+'.cer', data:L.cer},{name:L.base+'.key', data:L.key},{name:'LEEME.txt', data:leeme(L)},{name:'huella_sha256.txt', data:i.fingerprint+'\r\n'}]), 'application/zip');
+  });
+  $('#useInst').addEventListener('click', function(){
+    var s = signers.filter(function(x){ return !x.signer; })[0] || addSigner();
+    setLoaded(s, Object.assign({}, L.signer, {test:false}));
+    if (!$('.sg-role',s.el).value) $('.sg-role',s.el).value = 'Sello institucional';
+    document.querySelector('nav.tabs button[data-tab=firmar]').click();
+    window.scrollTo(0, s.el.getBoundingClientRect().top + window.scrollY - 80);
+  });
+}
+
+function renderTrust(){
+  var page = FIRMAPDF_CONFIANZA.map(function(t){ return {fp:t.fp, nombre:t.nombre, origen:'página'}; });
+  var loc = localTrust().map(function(t){ return {fp:t.fp, nombre:t.nombre, origen:'equipo', alta:t.alta}; });
+  var all = page.concat(loc);
+  $('#trustList').innerHTML = all.length ? '<ul class="checks">'+all.map(function(t){
+    return '<li><span>⭐</span><span style="flex:1"><b>'+esc(t.nombre)+'</b> <span class="badge" style="background:var(--acc2);color:var(--acc)">'+(t.origen==='página'?'en esta página':'en este equipo')+'</span><br><span class="mono">'+esc(t.fp)+'</span></span>'+
+      (t.origen==='equipo' ? '<button class="sg-rm" data-fp="'+esc(t.fp)+'">✕ Quitar</button>' : '')+'</li>'; }).join('')+'</ul>'
+    : '<p class="note">Aún no hay certificados en la lista.</p>';
+  document.querySelectorAll('#trustList .sg-rm').forEach(function(b){
+    b.addEventListener('click', function(){ saveLocalTrust(localTrust().filter(function(t){ return t.fp!==b.dataset.fp; })); renderTrust(); });
+  });
+}
+$('#fTrust').addEventListener('change', async function(){
+  var f = this.files[0]; if (!f) return;
+  try {
+    var u8 = await readFile(f), bin = FirmaCore.u8ToBin(u8);
+    var cert = bin.indexOf('-----BEGIN')!==-1 ? forge.pki.certificateFromPem(bin) : forge.pki.certificateFromAsn1(forge.asn1.fromDer(bin));
+    var der = bin.indexOf('-----BEGIN')!==-1 ? forge.pem.decode(bin)[0].body : bin;
+    cert._der = der;
+    var info = FirmaCore.certInfo(cert);
+    var ok = addTrust(info.fingerprint, info.nombre);
+    msg('#trustMsg', ok?'ok':'warn', ok ? 'Agregado: <b>'+esc(info.nombre)+'</b>'+(info.institucional?'':' (no es un sello institucional de FirmaPDF, pero se reconocerá por su huella)')+'.' : 'Este navegador no permite guardar la lista.');
+  } catch(e){ msg('#trustMsg','bad','No se pudo leer el certificado: '+esc(e.message||e)); }
+  this.value='';
+});
+renderTrust();
+
 /* ---------- llegada desde un QR (#v=...) ---------- */
 var qrData = FirmaCore.parseQrHash(location.hash);
 if (qrData){
@@ -3594,9 +3878,10 @@ if (qrData){
   $('#qrBox').innerHTML = '<div class="sigcard" style="margin-bottom:12px;border-color:var(--acc)">'+
     '<div style="font-weight:700;color:var(--acc);margin-bottom:6px">📱 Firma indicada en el código QR</div><div class="kv">'+
     '<div>Firmante</div><div><b>'+esc(qrData.nombre)+'</b></div>'+
-    '<div>RFC</div><div>'+esc(qrData.rfc||'—')+'</div>'+
+    (qrData.rfc?'<div>RFC</div><div>'+esc(qrData.rfc)+'</div>':'')+
     '<div>No. certificado</div><div class="mono">'+esc(qrData.noCertificado)+'</div>'+
     (qrData.cargo?'<div>Cargo</div><div>'+esc(qrData.cargo)+'</div>':'')+
+    (qrData.huella?'<div>Huella (inicio)</div><div class="mono">'+esc(qrData.huella.match(/../g).join(':'))+'…</div>':'')+
     '<div>Fecha de firma</div><div>'+fmtDate(qrData.fecha)+'</div>'+
     '<div>Tipo</div><div>'+(qrData.certifyP?'Certificación del documento':'Firma de aprobación')+'</div></div>'+
     '<div class="msg info">El código QR solo identifica la firma. <b>Para comprobar que el documento es auténtico y no fue modificado, carga aquí el PDF que recibiste.</b></div></div>';
