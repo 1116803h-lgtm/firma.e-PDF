@@ -68,6 +68,15 @@
   .sg-rm{border:none;background:none;color:var(--bad);cursor:pointer;font:inherit;font-size:13px}
   .sg-loaded{display:flex;justify-content:space-between;gap:12px;align-items:center}
   #btnAdd{margin-top:4px}
+  .layout{display:grid;grid-template-columns:1fr 210px;gap:20px;align-items:start}
+  @media (max-width:700px){.layout{grid-template-columns:1fr}}
+  .layout-prev svg{width:100%;max-width:210px;display:block;margin:10px auto 4px;background:#fff;border:1px solid var(--line);border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
+  .posgrid{display:grid;grid-template-columns:repeat(3,44px);gap:6px}
+  .posgrid button,.seg button{border:1px solid var(--line);background:#fff;border-radius:8px;font:inherit;cursor:pointer;color:var(--muted)}
+  .posgrid button{height:38px;font-size:18px}
+  .posgrid button.on,.seg button.on{background:var(--acc);border-color:var(--acc);color:#fff}
+  .seg{display:flex;flex-wrap:wrap;gap:6px}
+  .seg button{padding:8px 12px;font-size:14px}
 </style>
 <script>/* pdf-lib 1.17.1 (MIT) */
 !function(t,e){"object"==typeof exports&&"undefined"!=typeof module?e(exports):"function"==typeof define&&define.amd?define(["exports"],e):e((t=t||self).PDFLib={})}(this,(function(t){"use strict";
@@ -2683,16 +2692,49 @@ function existingSigFields(pdf){
   }
   return out;
 }
-function countSigSlots(ctx, page){
-  var L=PDFLib, n=0, raw=page.node.get(L.PDFName.of('Annots'));
+/* Rectángulos de los sellos de firma que ya hay en una página */
+function occupiedRects(ctx, page){
+  var L=PDFLib, out=[], raw=page.node.get(L.PDFName.of('Annots'));
   var arr = raw instanceof L.PDFRef ? ctx.lookup(raw) : raw;
   if (arr instanceof L.PDFArray) for (var a=0;a<arr.size();a++){
     var an = ctx.lookup(arr.get(a));
     if (!(an instanceof L.PDFDict) || !isSigDict(ctx, an)) continue;
     var rr = an.get(L.PDFName.of('Rect')); rr = rr && ctx.lookup(rr);
-    if (rr instanceof L.PDFArray && rr.size()===4 && Math.abs(rr.get(2).asNumber()-rr.get(0).asNumber())>1) n++;
+    if (!(rr instanceof L.PDFArray) || rr.size()!==4) continue;
+    var v = [0,1,2,3].map(function(i){ return rr.get(i).asNumber(); });
+    var r = [Math.min(v[0],v[2]), Math.min(v[1],v[3]), Math.max(v[0],v[2]), Math.max(v[1],v[3])];
+    if (r[2]-r[0]>1 && r[3]-r[1]>1) out.push(r);
   }
-  return n;
+  return out;
+}
+var SIZES = {s:0.8, m:1, l:1.25};
+var ROT_MATRIX = {left:'/Matrix [0 1 -1 0 0 0]', right:'/Matrix [0 -1 1 0 0 0]'};
+function footprint(size, rotate){
+  var k = SIZES[size]||1, w = STAMP_W*k, h = STAMP_H*k;
+  return (rotate==='left'||rotate==='right') ? [h, w] : [w, h];
+}
+/* Busca el primer lugar libre, empezando por la esquina elegida */
+function placeRect(box, fw, fh, pos, occupied){
+  var m = 20, gap = 8;
+  var vert = pos.charAt(0)==='t' ? 't' : 'b', hor = pos.charAt(1)||'r';
+  var cols = Math.max(1, Math.floor((box.width-2*m+gap)/(fw+gap)));
+  var rows = Math.max(1, Math.floor((box.height-2*m+gap)/(fh+gap)));
+  var hit = function(r){ return occupied.some(function(o){ return r[0]<o[2]-0.5 && r[2]>o[0]+0.5 && r[1]<o[3]-0.5 && r[3]>o[1]+0.5; }); };
+  function cand(row, col){
+    var x = hor==='c' ? box.x+(box.width-fw)/2 : hor==='l' ? box.x+m+col*(fw+gap) : box.x+box.width-m-fw-col*(fw+gap);
+    var y = vert==='t' ? box.y+box.height-m-fh-row*(fh+gap) : box.y+m+row*(fh+gap);
+    return [x, y, x+fw, y+fh];
+  }
+  var nc = hor==='c' ? 1 : cols;
+  for (var row=0; row<rows; row++) for (var col=0; col<nc; col++){
+    var r = cand(row, col); if (!hit(r)) return r;
+  }
+  // sin lugar libre en ese acomodo: probar con desplazamientos finos antes de encimar
+  for (var dy=0; dy<=box.height-2*m-fh; dy+=10) for (var dx=0; dx<=box.width-2*m-fw; dx+=10){
+    var x = hor==='l' ? box.x+m+dx : box.x+box.width-m-fw-dx, y = vert==='t' ? box.y+box.height-m-fh-dy : box.y+m+dy;
+    var r2 = [x,y,x+fw,y+fh]; if (!hit(r2)) return r2;
+  }
+  return cand(0,0);
 }
 async function placeholderAppearance(role){
   var F = await metrics(), W=STAMP_W, H=STAMP_H, c=[];
@@ -2707,6 +2749,7 @@ async function inspectPdf(u8){
     var pdf = await PDFLib.PDFDocument.load(u8, {updateMetadata:false});
     if (pdf.context.trailerInfo.Encrypt) throw new Error('encrypted');
     res.pages = pdf.getPageCount();
+    res.pageBoxes = pdf.getPages().map(function(pg){ var b=pg.getCropBox(); return {x:b.x,y:b.y,width:b.width,height:b.height}; });
     var ex = existingSigFields(pdf);
     res.empty = ex.empty.map(function(e){ return {name:e.name, role:e.role}; });
     res.signed = ex.signed.length;
@@ -2759,17 +2802,9 @@ async function signPdf(pdfU8, signer, opts){
   var pages = pdf.getPages();
   var pIdx = opts.page==='first' ? 0 : (typeof opts.page==='number' ? Math.min(Math.max(opts.page-1,0),pages.length-1) : pages.length-1);
   var page = pages[pIdx];
-  var slot = countSigSlots(ctx, page);
-  function slotRect(n){
-    var cb = page.getCropBox(), m = 20, gap = 8, W=STAMP_W, H=STAMP_H;
-    var perRow = Math.max(1, Math.floor((cb.width-2*m+gap)/(W+gap)));
-    var pos = opts.position||'br', col = n%perRow, row = Math.floor(n/perRow), x;
-    if (pos==='bc'){ row=n; x = cb.x+(cb.width-W)/2; }
-    else if (pos==='bl') x = cb.x+m+col*(W+gap);
-    else x = cb.x+cb.width-m-W-col*(W+gap);
-    var y = cb.y+m+row*(H+gap);
-    return [x, y, x+W, y+H];
-  }
+  var rotate = (opts.rotate==='left'||opts.rotate==='right') ? opts.rotate : '';
+  var occupied = occupiedRects(ctx, page), fp = footprint(opts.size, rotate), cropBox = page.getCropBox();
+  function slotRect(){ var r = placeRect(cropBox, fp[0], fp[1], opts.position||'br', occupied); occupied.push(r); return r; }
   var rectTxt = function(r){ return '['+r.map(function(v){return (+v).toFixed(2);}).join(' ')+']'; };
 
   // --- objetos nuevos comunes ---
@@ -2786,9 +2821,23 @@ async function signPdf(pdfU8, signer, opts){
   created.push([sigRef, sigTxt]);
   var fontRes = '/Resources << /Font << /F1 '+f1Ref+' /F2 '+f2Ref+' >> >>';
   var bbox = '/BBox [0 0 '+STAMP_W+' '+STAMP_H+']';
+  // orientación del sello: la elegida, o la del espacio reservado que se va a firmar
+  var apRot = rotate;
+  if (target){
+    var tr = target.widget.get(L.PDFName.of('FirmaPDF_Rot'));
+    if (tr) apRot = tr.toString().slice(1);
+    else {
+      var trr = target.widget.lookupMaybe(L.PDFName.of('Rect'), L.PDFArray);
+      if (trr){ var tw = Math.abs(trr.get(2).asNumber()-trr.get(0).asNumber()), th = Math.abs(trr.get(3).asNumber()-trr.get(1).asNumber());
+        apRot = th>tw*1.2 ? (rotate||'left') : ''; }
+    }
+    if (apRot!=='left' && apRot!=='right') apRot = '';
+  }
+  var mtx = function(r){ return r ? ' '+ROT_MATRIX[r] : ''; };
+  var rotKey = function(r){ return r ? ' /FirmaPDF_Rot /'+r : ''; };
   var wantVisible = opts.visible!==false;
   var ap = wantVisible ? await stampAppearance(info, {certifyP:certifyP, role:role, reason:opts.reason, verifyUrl:opts.verifyUrl}, now) : '';
-  created.push([apRef, {stream: ap, dict: '/Type /XObject /Subtype /Form '+bbox+' '+fontRes}]);
+  created.push([apRef, {stream: ap, dict: '/Type /XObject /Subtype /Form '+bbox+mtx(apRot)+' '+fontRes}]);
   created.push([f1Ref, '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>']);
   created.push([f2Ref, '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>']);
 
@@ -2802,10 +2851,10 @@ async function signPdf(pdfU8, signer, opts){
     usedField = target.name;
     if (target.pageIndex!=null) usedPage = target.pageIndex+1;
   } else {
-    var rect = wantVisible ? slotRect(slot++) : [0,0,0,0];
+    var rect = wantVisible ? slotRect() : [0,0,0,0];
     var wRef = ctx.nextRef(); usedField = nextName();
     created.push([wRef, '<< /Type /Annot /Subtype /Widget /FT /Sig /T '+hexText(usedField)+(role?' /TU '+hexText(role):'')+' /V '+sigRef+
-      ' /Rect '+rectTxt(rect)+' /F 132 /P '+page.ref+' /AP << /N '+apRef+' >> >>']);
+      ' /Rect '+rectTxt(rect)+' /F 132 /P '+page.ref+rotKey(rotate)+' /AP << /N '+apRef+' >> >>']);
     newWidgets.push(wRef);
   }
 
@@ -2814,11 +2863,11 @@ async function signPdf(pdfU8, signer, opts){
   if (reserve.length && st.certified && st.mdp===2 && !certifyP) reserve = [];  // no se pueden crear en un documento ya certificado
   for (var rI=0; rI<reserve.length; rI++){
     var rRole = reserve[rI] || '';
-    var rRect = wantVisible ? slotRect(slot++) : [0,0,0,0];
+    var rRect = wantVisible ? slotRect() : [0,0,0,0];
     var phRef = ctx.nextRef(), rwRef = ctx.nextRef();
-    created.push([phRef, {stream: wantVisible ? await placeholderAppearance(rRole) : '', dict: '/Type /XObject /Subtype /Form '+bbox+' '+fontRes}]);
+    created.push([phRef, {stream: wantVisible ? await placeholderAppearance(rRole) : '', dict: '/Type /XObject /Subtype /Form '+bbox+mtx(rotate)+' '+fontRes}]);
     created.push([rwRef, '<< /Type /Annot /Subtype /Widget /FT /Sig /T '+hexText(nextName())+(rRole?' /TU '+hexText(rRole):'')+
-      ' /Rect '+rectTxt(rRect)+' /F 4 /P '+page.ref+' /AP << /N '+phRef+' >> >>']);
+      ' /Rect '+rectTxt(rRect)+' /F 4 /P '+page.ref+rotKey(rotate)+' /AP << /N '+phRef+' >> >>']);
     newWidgets.push(rwRef);
   }
 
@@ -3049,7 +3098,7 @@ async function verifyPdf(u8){
   return out;
 }
 
-return {parseQrHash:parseQrHash, matchQr:matchQr, inspectPdf:inspectPdf, loadSigner:loadSigner, certInfo:certInfo, signPdf:signPdf, verifyPdf:verifyPdf, signingStatus:signingStatus,
+return {placeRect:placeRect, footprint:footprint, parseQrHash:parseQrHash, matchQr:matchQr, inspectPdf:inspectPdf, loadSigner:loadSigner, certInfo:certInfo, signPdf:signPdf, verifyPdf:verifyPdf, signingStatus:signingStatus,
         hasSignatures:hasSignatures, fmtLocal:fmtLocal, u8ToBin:u8ToBin, binToU8:binToU8};
 })();
 if (typeof module!=='undefined') module.exports = FirmaCore;
@@ -3109,12 +3158,28 @@ if (typeof module!=='undefined') module.exports = FirmaCore;
 
       <label class="opt on" style="margin-top:14px"><input type="checkbox" id="visible" checked>
         <div><b>Sellos visibles con QR</b><span>Recuadros con nombre, RFC, número de certificado, fecha y cargo. Se acomodan solos, uno junto a otro.</span></div></label>
-      <div class="grid3" id="visOpts">
-        <div><label>Página de los sellos</label>
-          <select id="page"><option value="last">Última página</option><option value="first">Primera página</option><option value="num">Número de página…</option></select></div>
-        <div><label>Número de página</label><input type="number" id="pageNum" min="1" value="1" disabled></div>
-        <div><label>Acomodo</label>
-          <select id="pos"><option value="br">Desde abajo a la derecha</option><option value="bl">Desde abajo a la izquierda</option><option value="bc">Abajo al centro (en columna)</option></select></div>
+      <div id="visOpts" class="layout">
+        <div class="layout-ctl">
+          <div class="grid2">
+            <div><label>Página de los sellos</label>
+              <select id="page"><option value="last">Última página</option><option value="first">Primera página</option><option value="num">Número de página…</option></select></div>
+            <div><label>Número de página</label><input type="number" id="pageNum" min="1" value="1" disabled></div>
+          </div>
+          <label>Posición</label>
+          <div class="posgrid" id="posGrid">
+            <button data-v="tl" title="Arriba a la izquierda">↖</button><button data-v="tc" title="Arriba al centro">↑</button><button data-v="tr" title="Arriba a la derecha">↗</button>
+            <button data-v="bl" title="Abajo a la izquierda">↙</button><button data-v="bc" title="Abajo al centro">↓</button><button data-v="br" class="on" title="Abajo a la derecha">↘</button>
+          </div>
+          <div class="note" id="posName">Abajo a la derecha</div>
+          <label>Rotación</label>
+          <div class="seg" id="rotSeg"><button data-v="" class="on">Sin rotar</button><button data-v="left">⟲ 90° izquierda</button><button data-v="right">⟳ 90° derecha</button></div>
+          <label>Tamaño del sello</label>
+          <div class="seg" id="sizeSeg"><button data-v="s">Pequeño</button><button data-v="m" class="on">Mediano</button><button data-v="l">Grande</button></div>
+        </div>
+        <div class="layout-prev">
+          <svg id="prevSvg" viewBox="0 0 612 792" preserveAspectRatio="xMidYMid meet"></svg>
+          <div class="note" style="text-align:center">Vista previa de la página</div>
+        </div>
       </div>
       <div class="grid2">
         <div><label>Motivo (opcional)</label><input type="text" id="reason" placeholder="Ej. Entrega de MIA – modalidad particular"></div>
@@ -3252,6 +3317,7 @@ function refresh(){
   $('#btnSign').disabled = !!b;
   $('#btnSign').innerHTML = '✍️ Firmar PDF' + (signers.length>1 ? ' ('+signers.length+' firmas)' : '');
   $('#signHint').textContent = b;
+  if (typeof drawPreview==='function') drawPreview();
 }
 
 /* ---------- 1. PDF ---------- */
@@ -3382,8 +3448,52 @@ addSigner();
 /* ---------- 3. opciones ---------- */
 document.querySelectorAll('input[name=mode]').forEach(function(r){ r.addEventListener('change', refresh); });
 $('#allowMore').addEventListener('change', refresh);
-$('#visible').addEventListener('change', function(){ $('#visOpts').style.opacity = this.checked?1:.4; this.closest('.opt').classList.toggle('on',this.checked); });
-$('#page').addEventListener('change', function(){ $('#pageNum').disabled = this.value!=='num'; });
+$('#visible').addEventListener('change', function(){ $('#visOpts').style.opacity = this.checked?1:.4; this.closest('.opt').classList.toggle('on',this.checked); drawPreview(); });
+$('#reserveRoles').addEventListener('input', function(){ drawPreview(); });
+$('#page').addEventListener('change', function(){ $('#pageNum').disabled = this.value!=='num'; drawPreview(); });
+$('#pageNum').addEventListener('input', drawPreview);
+var layout = {pos:'br', rotate:'', size:'m'};
+var POS_NAMES = {tl:'Arriba a la izquierda', tc:'Arriba al centro', tr:'Arriba a la derecha', bl:'Abajo a la izquierda', bc:'Abajo al centro', br:'Abajo a la derecha'};
+function seg(sel, key){
+  document.querySelectorAll(sel+' button').forEach(function(b){
+    b.addEventListener('click', function(e){
+      e.preventDefault();
+      document.querySelectorAll(sel+' button').forEach(function(x){ x.classList.toggle('on', x===b); });
+      layout[key] = b.dataset.v;
+      if (key==='pos') $('#posName').textContent = POS_NAMES[b.dataset.v];
+      drawPreview();
+    });
+  });
+}
+seg('#posGrid','pos'); seg('#rotSeg','rotate'); seg('#sizeSeg','size');
+function previewBox(){
+  var bx = pdf && pdf.insp && pdf.insp.pageBoxes;
+  if (!bx || !bx.length) return {x:0,y:0,width:612,height:792};
+  var pg = $('#page').value, i = pg==='first' ? 0 : pg==='num' ? Math.min(Math.max((+$('#pageNum').value||1)-1,0), bx.length-1) : bx.length-1;
+  return bx[i];
+}
+function drawPreview(){
+  var svg = $('#prevSvg'); if (!svg || !layout) return;
+  var box = previewBox(), W = box.width, H = box.height;
+  svg.setAttribute('viewBox', '0 0 '+W+' '+H);
+  var lines = '';
+  for (var i=0;i<9;i++) lines += '<rect x="'+(W*0.1)+'" y="'+(H*0.08+i*H*0.045)+'" width="'+(W*(i%3===2?0.55:0.8))+'" height="'+(H*0.012)+'" fill="#e3e7e5"/>';
+  var out = '<rect width="'+W+'" height="'+H+'" fill="#fff"/>'+lines;
+  if ($('#visible').checked){
+    var n = Math.max(1, signers.length) + (!alreadySigned() && mode()==='certify' && $('#allowMore').checked ? extraRoles().length : 0);
+    if (alreadySigned()) n = Math.max(1, signers.length);
+    var fp = FirmaCore.footprint(layout.size, layout.rotate), occ = [], rel = {x:0,y:0,width:W,height:H};
+    for (var k=0;k<n;k++){
+      var r = FirmaCore.placeRect(rel, fp[0], fp[1], layout.pos, occ); occ.push(r);
+      var x=r[0], y=H-r[3], w=r[2]-r[0], h=r[3]-r[1], cx=x+w/2, cy=y+h/2;
+      var first = k===0;
+      var ang = layout.rotate==='left' ? -90 : layout.rotate==='right' ? 90 : 0;
+      out += '<rect x="'+x+'" y="'+y+'" width="'+w+'" height="'+h+'" rx="3" fill="'+(first?'#e7f0ec':'#f7f8f7')+'" stroke="'+(first?'#1f5f4a':'#8a948f')+'" stroke-width="3"'+(first?'':' stroke-dasharray="10 6"')+'/>';
+      out += '<text x="'+cx+'" y="'+cy+'" text-anchor="middle" dominant-baseline="central" font-size="'+Math.min(34, Math.max(w,h)/7)+'" font-weight="700" fill="'+(first?'#1f5f4a':'#8a948f')+'" transform="rotate('+ang+' '+cx+' '+cy+')">Firma '+(k+1)+'</text>';
+    }
+  }
+  svg.innerHTML = out;
+}
 try { var u = localStorage.getItem('firmapdf:url'); if (u) $('#verifyUrl').value = u; } catch(e){}
 
 /* ---------- FIRMAR ---------- */
@@ -3394,7 +3504,7 @@ $('#btnSign').addEventListener('click', async function(){
   var url = $('#verifyUrl').value.trim();
   try { localStorage.setItem('firmapdf:url', url); } catch(e){}
   var pg = $('#page').value, page = pg==='num' ? (+$('#pageNum').value||1) : pg;
-  var common = {visible:$('#visible').checked, page:page, position:$('#pos').value,
+  var common = {visible:$('#visible').checked, page:page, position:layout.pos, rotate:layout.rotate, size:layout.size,
                 reason:$('#reason').value.trim(), location:$('#location').value.trim(), verifyUrl:url};
   var certify = !alreadySigned() && mode()==='certify';
   var roles = signers.map(function(s){ return $('.sg-role',s.el).value.trim(); });
